@@ -1,0 +1,13 @@
+Source: aekv
+Section: devel
+Priority: optional
+Maintainer: Chris Anderson <chris@raitechnology.com>
+Build-Depends: debhelper (>= 9), raikv, libpcre2-dev, chrpath, aeron, hdrhist, zlib1g-dev
+Standards-Version: 3.9.5
+Homepage: https://www.github.com/raitechnology/aekv
+
+Package: aekv
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Aeron KV
+ Aeron KV pubsub

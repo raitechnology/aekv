@@ -1,0 +1,7 @@
+[submodule "raikv"]
+	path = raikv
+	url = https://github.com/raitechnology/raikv
+[submodule "aeron"]
+	path = aeron
+	url = https://github.com/raitechnology/aeron
+	branch = rai
