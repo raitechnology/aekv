@@ -26,7 +26,7 @@ static char aeron_dbg_path[ 40 ];
 
 EvAeron::EvAeron( EvPoll &p ) noexcept
     : EvSocket( p, p.register_type( "aeron" ) ),
-      KvSendQueue( p.map->hdr.create_stamp, p.ctx_id ),
+      KvSendQueue( p.create_ns(), p.ctx_id ),
       context( 0 ), aeron( 0 ), pub( 0 ), sub( 0 ), fragment_asm( 0 )
 {
   this->timer_id = (uint64_t) this->sock_type << 56;
@@ -34,7 +34,6 @@ EvAeron::EvAeron( EvPoll &p ) noexcept
   ::snprintf( aeron_dbg_path, sizeof( aeron_dbg_path ),
               "/tmp/aeron_dbg.%u", getpid() );
   printf( "debug: %s\n", aeron_dbg_path );
-  p.add_route_notify( *this );
 }
 
 void
@@ -78,40 +77,52 @@ print_unavail_img( void *, aeron_subscription_t *subscription,
 }
 /* allocate aeron client */
 EvAeron *
-EvAeron::create_aeron( EvPoll &p,  const char *pub_channel,
-                       int pub_stream_id,  const char *sub_channel,
-                       int sub_stream_id ) noexcept
+EvAeron::create_aeron( EvPoll &p ) noexcept
 {
   void * m = aligned_malloc( sizeof( EvAeron ) );
   if ( m == NULL ) {
     perror( "alloc aeron" );
     return NULL;
   }
-  EvAeron * a = new ( m ) EvAeron( p );
-  int pfd = p.get_null_fd();
-  a->PeerData::init_peer( pfd, NULL, "aeron" );
-  a->sock_opts = kv::OPT_NO_POLL | kv::OPT_NO_CLOSE;
-  if ( p.add_sock( a ) < 0 ) {
+  return new ( m ) EvAeron( p );
+}
+
+bool
+EvAeron::start_aeron( const char *pub_channel,
+                      int pub_stream_id,  const char *sub_channel,
+                      int sub_stream_id ) noexcept
+{
+  int pfd = this->poll.get_null_fd();
+  this->PeerData::init_peer( pfd, NULL, "aeron" );
+  this->sock_opts = kv::OPT_NO_POLL | kv::OPT_NO_CLOSE;
+  if ( this->poll.add_sock( this ) < 0 ) {
     fprintf( stderr, "failed to add aeron\n" );
     return NULL;
   }
-  if ( ! a->init_aeron( pub_channel, pub_stream_id, sub_channel,
-                        sub_stream_id ) ) {
+  if ( ! this->init_pubsub( pub_channel, pub_stream_id, sub_channel,
+                            sub_stream_id ) ) {
     fprintf( stderr, "failed to init aeron: %s\n", aeron_errmsg() );
-    a->release();
-    p.remove_sock( a );
-    return NULL;
+    this->release_aeron();
+    return false;
   }
-  p.add_timer_micros( pfd, AERON_POLL_US, a->timer_id, POLL_EVENT_ID );
-  p.add_timer_micros( pfd, AERON_HEARTBEAT_US, a->timer_id, HB_EVENT_ID );
-  a->create_kvmsg( KV_MSG_HELLO, sizeof( KvMsg ) );
-  a->idle_push( EV_WRITE );
-  return a;
+  this->timer_id += 1; /* unique for this instance */
+  /* want notification of route mod from other pubsub protos */
+  this->poll.add_route_notify( *this );
+  /* poll aeron messages */
+  this->poll.add_timer_micros( this->fd, AERON_POLL_US, this->timer_id,
+                               POLL_EVENT_ID );
+  /* send heartbeats */
+  this->poll.add_timer_micros( this->fd, AERON_HEARTBEAT_US, this->timer_id,
+                               HB_EVENT_ID );
+  /* first heartbeat */
+  this->create_kvmsg( KV_MSG_HELLO, sizeof( KvMsg ) );
+  this->idle_push( EV_WRITE );
+  return true;
 }
 /* tell the aeron driver which sub and pub streams are used */
 bool
-EvAeron::init_aeron( const char *pub_channel,  int pub_stream_id,
-                     const char *sub_channel,  int sub_stream_id ) noexcept
+EvAeron::init_pubsub( const char *pub_channel,  int pub_stream_id,
+                      const char *sub_channel,  int sub_stream_id ) noexcept
 {
   aeron_async_add_publication_t  * async_pub = NULL;
   aeron_async_add_subscription_t * async_sub = NULL;
@@ -164,17 +175,38 @@ EvAeron::write( void ) noexcept
   this->pop( EV_WRITE );
 }
 /* read is handled by poll(), which is a timer based event */
-void EvAeron::read( void ) noexcept {}
+void EvAeron::read( void ) noexcept
+{
+  static const uint32_t fragment_count_limit = 10;
+  int fragments_read;
+
+  for (;;) {
+    fragments_read = aeron_subscription_poll( this->sub,
+                                           aeron_fragment_assembler_handler,
+                                              this->fragment_asm,
+                                              fragment_count_limit );
+    if ( fragments_read <= 0 ) {
+      if ( fragments_read == 0 )
+        break;
+      fprintf( stderr, "aeron_subscription_poll: %s\n", aeron_errmsg() );
+      this->push( EV_CLOSE );
+      break;
+    }
+  }
+}
+
 void EvAeron::process( void ) noexcept {}
 /* shutdown aeron client */
 void
 EvAeron::process_shutdown( void ) noexcept
 {
+  /* stop notification of route +/- */
   this->poll.remove_route_notify( *this );
+  this->pushpop( EV_CLOSE, EV_SHUTDOWN );
 }
 /* close the aeron sub/pub streams */
 void
-EvAeron::release( void ) noexcept
+EvAeron::process_close( void ) noexcept
 {
   if ( this->sub != NULL )
     aeron_subscription_close( this->sub, NULL, NULL );
@@ -186,7 +218,17 @@ EvAeron::release( void ) noexcept
     aeron_context_close( this->context );
   if ( this->fragment_asm != NULL )
     aeron_fragment_assembler_delete( this->fragment_asm );
+}
 
+void
+EvAeron::release( void ) noexcept
+{
+  this->release_aeron();
+}
+
+void
+EvAeron::release_aeron( void ) noexcept
+{
   this->sub          = NULL;
   this->pub          = NULL;
   this->aeron        = NULL;
@@ -196,27 +238,14 @@ EvAeron::release( void ) noexcept
 /* timer based events, poll for new messages, send heartbeats,
  * check for session timeouts  */
 bool
-EvAeron::timer_expire( uint64_t,  uint64_t event_id ) noexcept
+EvAeron::timer_expire( uint64_t tid,  uint64_t event_id ) noexcept
 {
+  if ( tid != this->timer_id )
+    return false;
   this->cur_mono_ns = kv_current_monotonic_coarse_ns();
   switch ( event_id ) {
     case POLL_EVENT_ID: {
-      static const uint32_t fragment_count_limit = 10;
-      int fragments_read;
-      
-      for (;;) {
-        fragments_read = aeron_subscription_poll( this->sub,
-                                               aeron_fragment_assembler_handler,
-                                                  this->fragment_asm,
-                                                  fragment_count_limit );
-        if ( fragments_read <= 0 ) {
-          if ( fragments_read == 0 )
-            break;
-          fprintf( stderr, "aeron_subscription_poll: %s\n", aeron_errmsg() );
-          this->push( EV_CLOSE );
-          break;
-        }
-      }
+      this->read();
       break;
     }
     case HB_EVENT_ID: {

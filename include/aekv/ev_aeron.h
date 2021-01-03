@@ -380,20 +380,23 @@ struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
 
   void * operator new( size_t, void *ptr ) { return ptr; }
   EvAeron( kv::EvPoll &p ) noexcept;
-  static EvAeron *create_aeron( kv::EvPoll &p,  const char *pub_channel,
-                                int pub_stream_id,  const char *sub_channel,
-                                int sub_stream_id ) noexcept;
+  static EvAeron *create_aeron( kv::EvPoll &p ) noexcept;
+  bool start_aeron( const char *pub_channel,  int pub_stream_id,
+                    const char *sub_channel, int sub_stream_id ) noexcept;
+  void release_aeron( void ) noexcept;
+
   /* EvSocket */
   virtual void write( void ) noexcept final;
   virtual void read( void ) noexcept final;
   virtual void process( void ) noexcept final;
   virtual void release( void ) noexcept final;
   virtual bool timer_expire( uint64_t timer_id, uint64_t event_id ) noexcept;
-  virtual void process_shutdown( void ) noexcept;
+  virtual void process_shutdown( void ) noexcept final;
+  virtual void process_close( void ) noexcept final;
   virtual bool on_msg( kv::EvPublish &pub ) noexcept;
 
-  bool init_aeron( const char *pub_channel,  int pub_stream_id,
-                   const char *sub_channel,  int sub_stream_id ) noexcept;
+  bool init_pubsub( const char *pub_channel,  int pub_stream_id,
+                    const char *sub_channel,  int sub_stream_id ) noexcept;
   static void poll_handler( void *clientd,  const uint8_t *buffer,
                             size_t length,  aeron_header_t *header );
   void on_poll_handler( const uint8_t *buffer,  size_t length,
