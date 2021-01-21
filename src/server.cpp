@@ -25,7 +25,7 @@ struct Loop : public MainLoop<Args> {
   bool aeron_init( void ) {
     this->aeron_sv = EvAeron::create_aeron( this->poll );
     if ( this->aeron_sv != NULL )
-      return this->aeron_sv->start_aeron( "aeron:ipc", 100, "aeron:ipc", 100 );
+      return this->aeron_sv->start_aeron( NULL, "aeron:ipc", 100, "aeron:ipc", 100 );
     return false;
   }
 

@@ -7,6 +7,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <aekv/ev_aeron.h>
 #include <aeronc.h>
 #include <raikv/ev_publish.h>
@@ -22,18 +23,21 @@ static const uint64_t AERON_POLL_US      = 100,
                       AERON_TIMEOUT_NS   = AERON_HEARTBEAT_US * 1000 * 25;
 static const uint32_t POLL_EVENT_ID = 0,
                       HB_EVENT_ID   = 1;
-static char aeron_dbg_path[ 40 ];
+/*static char aeron_dbg_path[ 40 ];*/
 
 EvAeron::EvAeron( EvPoll &p ) noexcept
     : EvSocket( p, p.register_type( "aeron" ) ),
       KvSendQueue( p.create_ns(), p.ctx_id ),
-      context( 0 ), aeron( 0 ), pub( 0 ), sub( 0 ), fragment_asm( 0 )
+      context( 0 ), aeron( 0 ), pub( 0 ), sub( 0 ), fragment_asm( 0 ),
+      timer_id( 0 ), max_payload_len( MAX_KV_MSG_SIZE ), timer_count( 0 ),
+      shutdown_count( 0 ), aeron_flags( 0 )
 {
-  this->timer_id = (uint64_t) this->sock_type << 56;
+  this->next_timer_id = (uint64_t) this->sock_type << 56;
   this->cur_mono_ns = kv_current_monotonic_coarse_ns();
-  ::snprintf( aeron_dbg_path, sizeof( aeron_dbg_path ),
+  this->set_ae( AE_FLAG_SHUTDOWN );
+  /*::snprintf( aeron_dbg_path, sizeof( aeron_dbg_path ),
               "/tmp/aeron_dbg.%u", getpid() );
-  printf( "debug: %s\n", aeron_dbg_path );
+  printf( "debug: %s\n", aeron_dbg_path );*/
 }
 
 void
@@ -49,11 +53,12 @@ print_avail_img( void *, aeron_subscription_t *subscription,
     fprintf( stderr, "could not get subscription/image constants: %s\n",
              aeron_errmsg() );
   }
+  /*
   else {
     printf( "Available image on %s streamId=%d sessionId=%d from %s\n",
             subscription_constants.channel, subscription_constants.stream_id,
             image_constants.session_id, image_constants.source_identity );
-  }
+  } */
 }
 
 void
@@ -69,11 +74,12 @@ print_unavail_img( void *, aeron_subscription_t *subscription,
     fprintf( stderr, "could not get subscription/image constants: %s\n",
              aeron_errmsg() );
   }
+  /*
   else {
     printf( "Unavailable image on %s streamId=%d sessionId=%d\n",
             subscription_constants.channel, subscription_constants.stream_id,
             image_constants.session_id );
-  }
+  }*/
 }
 /* allocate aeron client */
 EvAeron *
@@ -88,7 +94,7 @@ EvAeron::create_aeron( EvPoll &p ) noexcept
 }
 
 bool
-EvAeron::start_aeron( const char *pub_channel,
+EvAeron::start_aeron( AeronSvcId *id,  const char *pub_channel,
                       int pub_stream_id,  const char *sub_channel,
                       int sub_stream_id ) noexcept
 {
@@ -99,13 +105,25 @@ EvAeron::start_aeron( const char *pub_channel,
     fprintf( stderr, "failed to add aeron\n" );
     return NULL;
   }
+  this->timer_id = ++this->next_timer_id; /* unique for this instance */
+
+  uint32_t * u32 = (uint32_t *) (void *) &this->stamp;
+  uint16_t * u16 = (uint16_t *) (void *) &this->stamp;
+  if ( id != NULL ) {
+    u32[ 0 ] = id->pub_if;
+    u16[ 2 ] = id->pub_svc;
+    u16[ 3 ] = ( u16[ 3 ] + 1 ) & 0x7fff;
+  }
+  else {
+    u16[ 3 ] = ( ( u16[ 3 ] + 1 ) & 0x7fff ) | 0x8000;
+  }
+  this->timer_count = 1;
+  this->clear_ae( AE_FLAG_SHUTDOWN | AE_FLAG_BACKPRESSURE );
   if ( ! this->init_pubsub( pub_channel, pub_stream_id, sub_channel,
                             sub_stream_id ) ) {
     fprintf( stderr, "failed to init aeron: %s\n", aeron_errmsg() );
-    this->release_aeron();
     return false;
   }
-  this->timer_id += 1; /* unique for this instance */
   /* want notification of route mod from other pubsub protos */
   this->poll.add_route_notify( *this );
   /* poll aeron messages */
@@ -140,6 +158,12 @@ EvAeron::init_pubsub( const char *pub_channel,  int pub_stream_id,
       if ( status != 0 ) /* -1 = error, 1 = success */
         break;
     }
+    if ( status >= 0 ) {
+      aeron_publication_constants_t c;
+      status = aeron_publication_constants( this->pub, &c );
+      if ( status == 0 )
+        this->max_payload_len = c.max_payload_length;
+    }
   }
   if ( status >= 0 )
     status = aeron_async_add_subscription( &async_sub, this->aeron, sub_channel,
@@ -155,85 +179,208 @@ EvAeron::init_pubsub( const char *pub_channel,  int pub_stream_id,
   if ( status >= 0 )
     status = aeron_fragment_assembler_create( &this->fragment_asm,
                                               EvAeron::poll_handler, this );
-  return status == 0;
-}
-/* send the messages queued */
-void
-EvAeron::write( void ) noexcept
-{
-  while ( ! this->sendq.is_empty() ) {
-    KvMsgList * l = this->sendq.hd;
-    if ( aeron_publication_offer( this->pub, (const uint8_t *) (void *) &l->msg,
-                                  l->msg.size, NULL, NULL ) <= 0 ) {
-      return;
-    }
-    /*printf( "### write:" );
-    l->msg.print();*/
-    this->sendq.pop_hd();
-  }
-  this->snd_wrk.reset();
-  this->pop( EV_WRITE );
-}
-/* read is handled by poll(), which is a timer based event */
-void EvAeron::read( void ) noexcept
-{
-  static const uint32_t fragment_count_limit = 10;
-  int fragments_read;
-
-  for (;;) {
-    fragments_read = aeron_subscription_poll( this->sub,
-                                           aeron_fragment_assembler_handler,
-                                              this->fragment_asm,
-                                              fragment_count_limit );
-    if ( fragments_read <= 0 ) {
-      if ( fragments_read == 0 )
-        break;
-      fprintf( stderr, "aeron_subscription_poll: %s\n", aeron_errmsg() );
-      this->push( EV_CLOSE );
-      break;
-    }
-  }
-}
-
-void EvAeron::process( void ) noexcept {}
-/* shutdown aeron client */
-void
-EvAeron::process_shutdown( void ) noexcept
-{
-  /* stop notification of route +/- */
-  this->poll.remove_route_notify( *this );
-  this->pushpop( EV_CLOSE, EV_SHUTDOWN );
-}
-/* close the aeron sub/pub streams */
-void
-EvAeron::process_close( void ) noexcept
-{
-  if ( this->sub != NULL )
-    aeron_subscription_close( this->sub, NULL, NULL );
-  if ( this->pub != NULL )
-    aeron_publication_close( this->pub, NULL, NULL );
-  if ( this->aeron != NULL )
-    aeron_close( this->aeron );
-  if ( this->context != NULL )
-    aeron_context_close( this->context );
-  if ( this->fragment_asm != NULL )
-    aeron_fragment_assembler_delete( this->fragment_asm );
-}
-
-void
-EvAeron::release( void ) noexcept
-{
+  if ( status == 0 )
+    return true;
   this->release_aeron();
+  return false;
 }
 
 void
 EvAeron::release_aeron( void ) noexcept
 {
-  this->sub          = NULL;
-  this->pub          = NULL;
-  this->aeron        = NULL;
-  this->context      = NULL;
-  this->fragment_asm = NULL;
+  if ( this->sub != NULL ) {
+    aeron_subscription_close( this->sub, NULL, NULL );
+    this->sub = NULL;
+  }
+  if ( this->pub != NULL ) {
+    aeron_publication_close( this->pub, NULL, NULL );
+    this->pub = NULL;
+  }
+  if ( this->aeron != NULL ) {
+    aeron_close( this->aeron );
+    this->aeron = NULL;
+  }
+  if ( this->context != NULL ) {
+    aeron_context_close( this->context );
+    this->context = NULL;
+  }
+  if ( this->fragment_asm != NULL ) {
+    aeron_fragment_assembler_delete( this->fragment_asm );
+    this->fragment_asm = NULL;
+  }
+  this->sendq.init();
+  this->snd_wrk.reset();
+  this->timer_id       = 0;
+  this->timer_count    = 0;
+  this->shutdown_count = 0;
+  this->clear_ae( AE_FLAG_BACKPRESSURE );
+  this->set_ae( AE_FLAG_SHUTDOWN );
+}
+/* send the messages queued */
+void
+EvAeron::write( void ) noexcept
+{
+  this->pop( EV_WRITE );
+  if ( ! this->test_ae( AE_FLAG_SHUTDOWN ) ) {
+    int64_t status;
+    int retry_count = 0;
+    while ( ! this->sendq.is_empty() ) {
+      KvMsgList * l = this->sendq.hd;
+    retry:;
+      if ( (status = aeron_publication_offer( this->pub,
+                                            (const uint8_t *) (void *) &l->msg,
+                                            l->msg.size, NULL, NULL )) < 0 ) {
+        /* toss messages, not connected */
+        if ( status == AERON_PUBLICATION_NOT_CONNECTED ) {
+          this->sendq.init();
+          this->snd_wrk.reset();
+          this->clear_ae( AE_FLAG_BACKPRESSURE );
+          return;
+        }
+        /* try again later */
+        if ( status == AERON_PUBLICATION_BACK_PRESSURED ) {
+          this->set_ae( AE_FLAG_BACKPRESSURE );
+          return;
+        }
+        if ( status == AERON_PUBLICATION_ADMIN_ACTION ) {
+          status = aeron_publication_offer( this->pub,
+                                            (const uint8_t *) (void *) &l->msg,
+                                            l->msg.size, NULL, NULL );
+          if ( status < 0 ) {
+            if ( ++retry_count == 1 ) /* retry once */
+              goto retry;
+          }
+          else {
+            retry_count = 0;
+            goto success;
+          }
+        }
+        /* AERON_PUBLICATION_CLOSED, AERON_PUBLICATION_ERROR */
+        fprintf( stderr, "aeron_publication_offer: %ld, %s\n",
+                 status, aeron_errmsg() );
+        this->push( EV_CLOSE );
+        break;
+      }
+    success:;
+      this->sendq.pop_hd();
+    }
+  }
+  this->clear_ae( AE_FLAG_BACKPRESSURE );
+  this->snd_wrk.reset();
+}
+/* read is handled by poll(), which is a timer based event */
+void
+EvAeron::read( void ) noexcept
+{
+  static const uint32_t fragment_count_limit = 128;
+  int fragments_read;
+
+  if ( ! this->test_ae( AE_FLAG_SHUTDOWN ) ) {
+    for (;;) {
+      fragments_read = aeron_subscription_poll( this->sub,
+                                             aeron_fragment_assembler_handler,
+                                                this->fragment_asm,
+                                                fragment_count_limit );
+      if ( fragments_read <= 0 ) {
+        if ( fragments_read == 0 )
+          break;
+        fprintf( stderr, "aeron_subscription_poll: %s\n", aeron_errmsg() );
+        this->push( EV_CLOSE );
+        break;
+      }
+    }
+  }
+  this->pop3( EV_READ, EV_READ_HI, EV_READ_LO );
+}
+
+void EvAeron::process( void ) noexcept {}
+void EvAeron::on_connect( void ) noexcept {
+  printf( "connected\n" );
+}
+
+static void
+sub_close_cb( void *clientd )
+{
+  EvAeron &_this = *(EvAeron *) clientd;
+  if ( _this.shutdown_count != 0 )
+    _this.sub = NULL;
+}
+
+static void
+pub_close_cb( void *clientd )
+{
+  EvAeron &_this = *(EvAeron *) clientd;
+  if ( _this.shutdown_count != 0 )
+    _this.pub = NULL;
+}
+
+void
+EvAeron::do_shutdown( void ) noexcept
+{
+  this->create_kvmsg( KV_MSG_BYE, sizeof( KvMsg ) );
+  this->idle_push( EV_WRITE );
+  this->push( EV_SHUTDOWN );
+}
+
+/* shutdown aeron client */
+void
+EvAeron::process_shutdown( void ) noexcept
+{
+  this->start_shutdown();
+  /* stop notification of route +/- */
+  if ( this->check_shutdown() )
+    this->pushpop( EV_CLOSE, EV_SHUTDOWN );
+}
+
+void
+EvAeron::start_shutdown( void ) noexcept
+{
+  if ( ! this->test_ae( AE_FLAG_SHUTDOWN ) ) {
+    this->set_ae( AE_FLAG_SHUTDOWN );
+    this->timer_id = 0;
+    this->shutdown_count = 1;
+    this->poll.remove_route_notify( *this );
+    if ( this->sub != NULL )
+      aeron_subscription_close( this->sub, sub_close_cb, this );
+    if ( this->pub != NULL )
+      aeron_publication_close( this->pub, pub_close_cb, this );
+  }
+}
+
+bool
+EvAeron::check_shutdown( void ) noexcept
+{
+  if ( this->shutdown_count != 0 &&
+       ( this->sub != NULL || this->pub != NULL ) ) {
+    if ( ++this->shutdown_count == 1000 ) {
+      fprintf( stderr, "failed to shutdown aeron\n" );
+      this->sub = NULL;
+      this->pub = NULL;
+      return false;
+    }
+    usleep( 1 );
+  }
+  return this->sub != NULL || this->pub != NULL;
+}
+
+/* close the aeron sub/pub streams */
+void
+EvAeron::process_close( void ) noexcept
+{
+  this->start_shutdown();
+  this->clear_all_subs();
+  this->sub_tab.release();
+  this->pat_sub_tab.release();
+  this->my_peers.release();
+  this->my_subs.release();
+  while ( this->check_shutdown() )
+    ;
+  this->release_aeron();
+}
+
+void
+EvAeron::release( void ) noexcept
+{
 }
 /* timer based events, poll for new messages, send heartbeats,
  * check for session timeouts  */
@@ -249,16 +396,29 @@ EvAeron::timer_expire( uint64_t tid,  uint64_t event_id ) noexcept
       break;
     }
     case HB_EVENT_ID: {
-      if ( ::unlink( aeron_dbg_path ) == 0 )
-        this->print_stats();
+      /*if ( ::unlink( aeron_dbg_path ) == 0 )
+        this->print_stats();*/
       AeronSession *session =
         this->my_peers.check_timeout( this->cur_mono_ns - AERON_TIMEOUT_NS );
       if ( session != NULL ) {
         this->send_dataloss( *session );
         this->my_peers.release_session( *session );
       }
-      this->create_kvmsg( KV_MSG_HELLO, sizeof( KvMsg ) );
+      KvMsg *m = this->create_kvmsg( KV_MSG_HELLO,
+                                     sizeof( KvMsg ) + sizeof( uint64_t ) );
+      uint64_t peer = this->my_peers.next_ping();
+      ::memcpy( &m[ 1 ], &peer, sizeof( uint64_t ) );
       this->idle_push( EV_WRITE );
+
+      if ( this->timer_count > 0 ) {
+        if ( this->timer_count > this->my_peers.session_idx->elem_count + 3 ) {
+          this->on_connect();
+          this->timer_count = 0;
+        }
+        else {
+          this->timer_count++;
+        }
+      }
       break;
     }
   }
@@ -336,17 +496,16 @@ void
 EvAeron::publish_my_subs( void ) noexcept
 {
   uint32_t i = 0, j = 0;
-  while ( i < this->my_subs.subs_cnt ) {
+  while ( i < this->my_subs.subs_off ) {
     KvSubMsg &scan = *(KvSubMsg *) (void *) &this->my_subs.subs[ i + 1 ];
     if ( scan.sublen != 0 ) {
       KvSubMsg & msg = *this->KvSendQueue::copy_kvsubmsg( scan );
       msg.set_seqno( ++this->KvSendQueue::next_seqno );
-      printf( "puslish_sub: %.*s\n", msg.sublen, msg.subject() );
+      /*printf( "publish_sub: %.*s\n", msg.sublen, msg.subject() );*/
     }
     i += MySubs::subs_align( scan.size ) / sizeof( uint32_t ) + 1;
     j++;
   }
-  printf( "pub %u cnt %u\n", i, j );
   this->idle_push( EV_WRITE );
 }
 /* a cache for subscritions */
@@ -355,15 +514,29 @@ MySubs::MySubs() noexcept
   this->subsc_idx = UIntHashTab::resize( NULL );
   this->subs      = NULL;
   this->subs_free = 0;
-  this->subs_cnt  = 0;
+  this->subs_off  = 0;
   this->subs_size = 0;
 }
+
+void
+MySubs::release( void ) noexcept
+{
+  delete this->subsc_idx;
+  this->subsc_idx = UIntHashTab::resize( NULL );
+  if ( this->subs != NULL )
+    ::free( this->subs );
+  this->subs      = NULL;
+  this->subs_free = 0;
+  this->subs_off  = 0;
+  this->subs_size = 0;
+}
+
 /* append submsg to cache */
 uint32_t
 MySubs::append( KvSubMsg &msg ) noexcept
 {
   uint32_t i = subs_align( msg.size ) / sizeof( uint32_t ) + 1,
-           j = this->subs_cnt + i;
+           j = this->subs_off + i;
   if ( j > this->subs_size ) {
     uint32_t sz = ( ( j + 1 ) | 255 ) + 1;
     void   * p  = ::realloc( this->subs, sz * sizeof( uint32_t ) );
@@ -374,10 +547,10 @@ MySubs::append( KvSubMsg &msg ) noexcept
     this->subs = (uint32_t *) p;
     this->subs_size = sz;
   }
-  this->subs[ this->subs_cnt ] = 0;
-  ::memcpy( &this->subs[ this->subs_cnt + 1 ], &msg, msg.size );
-  this->subs_cnt += i;
-  return this->subs_cnt - i + 1;
+  this->subs[ this->subs_off ] = 0;
+  ::memcpy( &this->subs[ this->subs_off + 1 ], &msg, msg.size );
+  this->subs_off += i;
+  return this->subs_off - i + 1;
 }
 /* insert submsg, check for duplicates and maintain a list for hash collisions*/
 void
@@ -507,7 +680,7 @@ MySubs::gc( void ) noexcept
   uint32_t i = 0, j = 0;
 
   this->subsc_idx->clear_all();
-  while ( i < this->subs_cnt ) {
+  while ( i < this->subs_off ) {
     KvSubMsg &scan = *(KvSubMsg *) (void *) &this->subs[ i + 1 ];
     uint32_t k = subs_align( scan.size );
     if ( scan.sublen != 0 ) {
@@ -525,7 +698,7 @@ MySubs::gc( void ) noexcept
     }
     i += k / sizeof( uint32_t ) + 1;
   }
-  this->subs_cnt  = j;
+  this->subs_off  = j;
   this->subs_free = 0;
 }
 /* publish a message from bridge proto to aeron network */
@@ -537,7 +710,8 @@ EvAeron::on_msg( EvPublish &pub ) noexcept
     this->create_kvpublish( pub.subj_hash, pub.subject, pub.subject_len,
                             pub.prefix, pub.hash, pub.prefix_cnt,
                             (const char *) pub.reply, pub.reply_len, pub.msg,
-                            pub.msg_len, pub.pub_type, pub.msg_enc );
+                            pub.msg_len, pub.pub_type, pub.msg_enc,
+                            this->max_payload_len );
     this->idle_push( EV_WRITE );
   }
 /*  if ( this->backlogq.is_empty() )*/
@@ -553,7 +727,7 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
   KvMsg  & msg = *(KvMsg *) (void *) buffer;
 
   if ( ! msg.is_valid( length ) ) {
-    fprintf( stderr, "Invalid message, length %lu\n", length );
+    fprintf( stderr, "Invalid message, length %lu < %u\n", length, msg.size );
     KvHexDump::dump_hex( buffer, length < 256 ? length : 256 );
     return;
   }
@@ -585,29 +759,42 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
   session->last_active = this->cur_mono_ns;
 
   if ( msg.msg_type == KV_MSG_PUBLISH ) {
-    /* forward message from publisher to shm */
-    session->pub_count++;
     KvSubMsg & submsg = (KvSubMsg &) msg;
-    EvPublish pub( submsg.subject(), submsg.sublen,
-                   submsg.reply(), submsg.replylen,
-                   submsg.get_msg_data(), submsg.msg_size,
-                   this->fd, submsg.hash, NULL, 0,
-                   submsg.msg_enc, submsg.code );
-    this->poll.forward_msg( pub, NULL, submsg.get_prefix_cnt(),
-                            submsg.prefix_array() );
-    return;
-  }
-
-  if ( session->test( SESSION_NEW ) ) {
-    session->clear( SESSION_NEW );
-    if ( msg.msg_type != KV_MSG_BYE )
-      this->publish_my_subs();
+    if ( session->frag == NULL ) {
+    do_dispatch:;
+      /* forward message from publisher to shm */
+      session->pub_count++;
+      EvPublish pub( submsg.subject(), submsg.sublen,
+                     submsg.reply(), submsg.replylen,
+                     submsg.get_msg_data(), submsg.msg_size,
+                     this->fd, submsg.hash, NULL, 0,
+                     submsg.msg_enc, submsg.code );
+      this->poll.forward_msg( pub, NULL, submsg.get_prefix_cnt(),
+                              submsg.prefix_array() );
+      return;
+    }
+    KvFragAsm * frag = KvFragAsm::merge( session->frag, submsg );
+    if ( frag != NULL ) {
+      session->pub_count++;
+      EvPublish pub( submsg.subject(), submsg.sublen,
+                     submsg.reply(), submsg.replylen,
+                     frag->buf, frag->msg_size,
+                     this->fd, submsg.hash, NULL, 0,
+                     submsg.msg_enc, submsg.code );
+      this->poll.forward_msg( pub, NULL, submsg.get_prefix_cnt(),
+                              submsg.prefix_array() );
+      KvFragAsm::release( session->frag );
+      return;
+    }
+    fprintf( stderr, "kv fragment dropped\n" );
+    goto do_dispatch;
   }
 
   AeronSubStatus stat;
   int            rcnt;
   switch ( msg.msg_type ) {
     case KV_MSG_FRAGMENT:
+      KvFragAsm::merge( session->frag, (KvSubMsg &) msg );
       break;
     case KV_MSG_SUB: { /* update my routing table when sub/unsub occurs */
       KvSubMsg &submsg = (KvSubMsg &) msg;
@@ -615,7 +802,7 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
       stat = this->sub_tab.put( submsg.hash, submsg.subject(),
                                 submsg.sublen, session->id );
       if ( stat == AERON_SUB_NEW ) {
-        printf( "new_sub: %.*s\n", submsg.sublen, submsg.subject() );
+        /*printf( "new_sub: %.*s\n", submsg.sublen, submsg.subject() );*/
         rcnt = this->poll.sub_route.add_sub_route( submsg.hash, this->fd );
         session->sub_count++; /* session was added */
       }
@@ -632,7 +819,7 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
         stat = this->sub_tab.rem( submsg.hash, submsg.subject(), submsg.sublen,
                                   session->id );
         if ( stat == AERON_SUB_REMOVED ) {
-          printf( "rem_sub: %.*s\n", submsg.sublen, submsg.subject() );
+          /*printf( "rem_sub: %.*s\n", submsg.sublen, submsg.subject() );*/
           if ( this->sub_tab.tab.find_by_hash( submsg.hash ) == NULL )
             rcnt = this->poll.sub_route.del_sub_route( submsg.hash, this->fd );
           session->sub_count--;
@@ -650,7 +837,7 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
                                     submsg.sublen + submsg.replylen + 2,
                                     submsg.replylen, session->id );
       if ( stat == AERON_SUB_NEW ) {
-        printf( "add_psub: %.*s\n", submsg.sublen, submsg.subject() );
+        /*printf( "add_psub: %.*s\n", submsg.sublen, submsg.subject() );*/
         rcnt = this->poll.sub_route.add_pattern_route( submsg.hash, this->fd,
                                                        submsg.replylen );
         session->psub_count++; /* session was added */
@@ -669,9 +856,9 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
                                       submsg.replylen, session->id, tmp ); 
         if ( stat == AERON_SUB_OK ) {
           if ( tmp.list.hd != NULL ) {
-            for ( AeronTmpElem *el = tmp.list.hd; el != NULL; el = el->next )
+            /*for ( AeronTmpElem *el = tmp.list.hd; el != NULL; el = el->next )
               printf( "rem_psub: %.*s\n", (int) el->x.pattern_len(),
-                                                el->x.pattern() );
+                                                el->x.pattern() );*/
             rcnt =
               this->poll.sub_route.del_pattern_route( submsg.hash, this->fd,
                                                       submsg.replylen );
@@ -692,8 +879,27 @@ EvAeron::on_poll_handler( const uint8_t *buffer,  size_t length,
       }
       break;
     }
-    case KV_MSG_HELLO:
+    case KV_MSG_HELLO: {
+      uint64_t ping;
+      if ( msg.size >= sizeof( KvMsg ) + sizeof( uint64_t ) ) {
+        ::memcpy( &ping, &buffer[ sizeof( KvMsg ) ], sizeof( uint64_t ) );
+        if ( ping == this->KvSendQueue::stamp ) {
+          if ( session->test( SESSION_NEW ) ) {
+            session->clear( SESSION_NEW );
+            if ( msg.msg_type != KV_MSG_BYE )
+              this->publish_my_subs();
+          }
+        }
+      }
+      else {
+        KvMsg *m = this->create_kvmsg( KV_MSG_HELLO,
+                                       sizeof( KvMsg ) + sizeof( uint64_t ) );
+        uint64_t peer = 0;
+        ::memcpy( &m[ 1 ], &peer, sizeof( uint64_t ) );
+        this->idle_push( EV_WRITE );
+      }
       break;
+    }
     case KV_MSG_BYE:
       session->clear();
       session->set( SESSION_BYE );
@@ -772,10 +978,8 @@ EvAeron::clear_subs( AeronSession &session ) noexcept
       uint32_t rcnt = 2;
       stat = AeronSubMap::remove_sub( this->sub_tab.zip, pos.rt->sub, id );
       if ( stat == AERON_SUB_REMOVED ) {
-        if ( this->sub_tab.tab.find_by_hash( pos.rt->hash ) == NULL ) {
-          rcnt = this->poll.sub_route.del_sub_route( pos.rt->hash, this->fd );
-          tmp.append( *pos.rt );
-        }
+        rcnt = this->poll.sub_route.del_sub_route( pos.rt->hash, this->fd );
+        tmp.append( *pos.rt );
       }
       if ( stat != AERON_SUB_NOT_FOUND ) {
         this->poll.notify_unsub( pos.rt->hash, pos.rt->value, pos.rt->len,
@@ -823,8 +1027,41 @@ MyPeers::MyPeers() noexcept
   this->last_session  = &this->dummy_session;
   this->sessions      = NULL;
   this->session_size  = 0;
+  this->ping_idx      = 0;
   this->last_check_ns = 0;
 }
+
+void
+MyPeers::release( void ) noexcept
+{
+  delete this->session_idx;
+  this->session_idx   = UIntHashTab::resize( NULL );
+  this->last_session  = &this->dummy_session;
+  if ( this->sessions != NULL )
+    ::free( this->sessions );
+  this->sessions      = NULL;
+  this->session_size  = 0;
+  this->ping_idx      = 0;
+  this->last_check_ns = 0;
+
+  AeronSession * s;
+  while ( ! this->list.is_empty() ) {
+    s = this->list.pop_hd();
+    if ( ( s->id % 64 ) == 0 )
+      this->free_list.push_hd( s );
+  }
+  for ( s = this->free_list.hd; s != NULL; ) {
+    AeronSession *next = s->next;
+    if ( ( s->id % 64 ) != 0 )
+      this->free_list.pop( s );
+    s = next;
+  }
+  while ( ! this->free_list.is_empty() ) {
+    s = this->free_list.pop_hd();
+    ::free( s );
+  }
+}
+
 /* creae a new session and index by stamp */
 AeronSession *
 MyPeers::new_session( uint64_t stamp,  uint64_t seqno, uint32_t h,
@@ -857,7 +1094,17 @@ MyPeers::new_session( uint64_t stamp,  uint64_t seqno, uint32_t h,
   if ( this->session_idx->need_resize() )
     this->session_idx = UIntHashTab::resize( this->session_idx );
 
-  printf( "new session %u seqno=%lu stamp=%lu\n", id, seqno, stamp );
+  uint8_t  * u8 = (uint8_t *) (void *) &stamp;
+  uint16_t * u16 = (uint16_t *) (void *) &stamp;
+  if ( ( u16[ 3 ] & 0x8000 ) == 0 ) {
+    printf( "new_session:          i=%u, seqno=%lu, peer=%u.%u.%u.%u:%u (%u)\n",
+             id, seqno, u8[ 0 ], u8[ 1 ], u8[ 2 ], u8[ 3 ], ntohs( u16[ 2 ] ),
+             u16[ 3 ] & 0x7fff );
+  }
+  else {
+    printf( "new_session:          i=%u, seqno=%lu, stamp=%lu\n", id, seqno,
+            stamp );
+  }
   this->sessions[ id ] = this->last_session;
   new ( this->last_session ) AeronSession( id, stamp, seqno, next_id );
   this->list.push_hd( this->last_session );
@@ -899,9 +1146,22 @@ MyPeers::release_session( AeronSession &session ) noexcept
         p = p->next_id;
       }
     }
+    KvFragAsm::release( session.frag );
     this->list.pop( &session );
     this->free_list.push_tl( &session );
-    printf( "release session %u stamp=%lu\n", session.id, session.stamp );
+
+    uint8_t  * u8 = (uint8_t *) (void *) &session.stamp;
+    uint16_t * u16 = (uint16_t *) (void *) &session.stamp;
+    if ( ( u16[ 3 ] & 0x8000 ) == 0 ) {
+      printf( "stop_session:         i=%u, seqno=%lu, peer=%u.%u.%u.%u:%u (%u)\n",
+              session.id, session.last_seqno,
+              u8[ 0 ], u8[ 1 ], u8[ 2 ], u8[ 3 ], ntohs( u16[ 2 ] ),
+              u16[ 3 ] & 0x7fff );
+    }
+    else {
+      printf( "stop_session:         i=%u, seqno=%lu, stamp=%lu\n",
+              session.id, session.last_seqno, session.stamp );
+    }
   }
   else {
     fprintf( stderr, "session %u stamp=%lu not found!\n",
@@ -1001,7 +1261,7 @@ void
 MySubs::print( EvPoll &poll ) noexcept
 {
   uint32_t i = 0;
-  while ( i < this->subs_cnt ) {
+  while ( i < this->subs_off ) {
     KvSubMsg &scan = *(KvSubMsg *) (void *) &this->subs[ i + 1 ];
     uint32_t k = subs_align( scan.size );
     if ( scan.sublen != 0 ) {

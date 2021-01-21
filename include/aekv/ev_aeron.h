@@ -59,6 +59,7 @@ struct AeronSubMap {
   }
   void release( void ) {           /* free ht */
     this->tab.release();
+    this->zip.reset();
   }
   /* add id to subject route */
   AeronSubStatus put( uint32_t h,  const char *sub,  size_t len, uint32_t id ) {
@@ -194,6 +195,7 @@ struct AeronPatternSubMap {
   }
   void release( void ) { /* release patterns table */
     this->tab.release();
+    this->zip.reset();
   }
   /* add id to list of routes for a pattern prefix */
   AeronSubStatus put( uint32_t h,  const char *sub,  size_t len,
@@ -249,19 +251,20 @@ enum SessionState {
 };
 
 struct AeronSession {
-  AeronSession * next,        /* link in MyPeers::list or MyPeers::free_list */
-               * back,
-               * next_id,     /* link in session_idx[] collision chain */
-               * last_id;
-  const uint64_t stamp;       /* identifies session uniquely */
-  uint64_t       last_active, /* time in ns of last message recvd */
-                 last_seqno,  /* seqno of last message recvd */
-                 delta_seqno, /* if missing seqno, this is delta missing */
-                 pub_count;   /* count of msgs published */
-  const uint32_t id;          /* id is index into sessions[] */
-  uint32_t       sub_count,   /* count of subscriptions */
-                 psub_count,  /* count of pattern subs */
-                 state;       /* state of session, bits of SessionState */
+  AeronSession  * next,        /* link in MyPeers::list or MyPeers::free_list */
+                * back,
+                * next_id,     /* link in session_idx[] collision chain */
+                * last_id;
+  kv::KvFragAsm * frag;
+  const uint64_t  stamp;       /* identifies session uniquely */
+  uint64_t        last_active, /* time in ns of last message recvd */
+                  last_seqno,  /* seqno of last message recvd */
+                  delta_seqno, /* if missing seqno, this is delta missing */
+                  pub_count;   /* count of msgs published */
+  const uint32_t  id;          /* id is index into sessions[] */
+  uint32_t        sub_count,   /* count of subscriptions */
+                  psub_count,  /* count of pattern subs */
+                  state;       /* state of session, bits of SessionState */
 
   void     set( SessionState fl )        { this->state |= (uint32_t) fl; }
   uint32_t test( SessionState fl ) const { return this->state & (uint32_t) fl; }
@@ -271,9 +274,10 @@ struct AeronSession {
   void * operator new( size_t, void *ptr ) { return ptr; }
   AeronSession( uint32_t i,  uint64_t stmp = 0,  uint64_t seq = 0,
                 AeronSession *nid = 0 )
-    : next( 0 ), back( 0 ), next_id( nid ), last_id( 0 ), stamp( stmp ),
-      last_active( 0 ), last_seqno( seq ), delta_seqno( 1 ), pub_count( 0 ),
-      id( i ), sub_count( 0 ), psub_count( 0 ), state( SESSION_NEW ) {
+    : next( 0 ), back( 0 ), next_id( nid ), last_id( 0 ), frag( 0 ),
+      stamp( stmp ), last_active( 0 ), last_seqno( seq ), delta_seqno( 1 ),
+      pub_count( 0 ), id( i ), sub_count( 0 ), psub_count( 0 ),
+      state( SESSION_NEW ) {
     if ( nid != NULL )
       nid->last_id = this;
   }
@@ -286,7 +290,8 @@ struct MyPeers {
   kv::UIntHashTab * session_idx;    /* idx of sessions[] */
   AeronSession    * last_session,   /* last sessions[] used */
                  ** sessions;       /* array of sessions */
-  uint32_t          session_size;   /* size of net_ses[] array */
+  uint32_t          session_size,   /* size of net_ses[] array */
+                    ping_idx;       /* ping peers */
   AeronSession      dummy_session;  /* a null session */
   uint64_t          last_check_ns;  /* last timeout check */
   MyPeers() noexcept;
@@ -343,14 +348,28 @@ struct MyPeers {
     }
     return NULL;
   }
+  uint64_t next_ping( void ) noexcept {
+    uint32_t j = this->ping_idx;
+    for ( uint32_t i = 0; i < this->session_size; i++ ) {
+      if ( j >= this->session_size )
+        j = 0;
+      if ( this->sessions[ j ] != NULL ) {
+        this->ping_idx = j + 1;
+        return this->sessions[ j ]->stamp;
+      }
+      j++;
+    }
+    return 0;
+  }
   void print( void ) noexcept;
+  void release( void ) noexcept;
 };
 
 struct MySubs {
   kv::UIntHashTab * subsc_idx;   /* subscriptions active internal */
   uint32_t        * subs;        /* array of subscription msgs */
   uint32_t          subs_free,   /* count of free message words */
-                    subs_cnt,    /* end of subs[] words array */
+                    subs_off,    /* end of subs[] words array */
                     subs_size;   /* alloc words size of subs[] array */
   MySubs() noexcept;
   void gc( void ) noexcept;
@@ -362,28 +381,49 @@ struct MySubs {
     return kv::align<uint32_t>( sz, 4 );
   }
   void print( kv::EvPoll &poll ) noexcept;
+  void release( void ) noexcept;
+};
+
+struct AeronSvcId {
+  uint32_t pub_if,  sub_if;
+  uint16_t pub_svc, sub_svc;
 };
 
 struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
                  public kv::RouteNotify {
+  enum {
+    AE_FLAG_SHUTDOWN     = 1,
+    AE_FLAG_BACKPRESSURE = 2
+  };
+
   aeron_context_t            * context;
   aeron_t                    * aeron;
   aeron_publication_t        * pub;
   aeron_subscription_t       * sub;
   aeron_fragment_assembler_t * fragment_asm;
-  uint64_t                     timer_id,
-                               cur_mono_ns;
   AeronSubMap                  sub_tab;     /* active subscriptions on net */
   AeronPatternSubMap           pat_sub_tab; /* active wildcards on net */
   MyPeers                      my_peers;
   MySubs                       my_subs;
+  uint64_t                     next_timer_id,
+                               timer_id,
+                               cur_mono_ns;
+  uint32_t                     max_payload_len,
+                               timer_count,
+                               shutdown_count,
+                               aeron_flags;
+
+  uint32_t test_ae( uint32_t fl ) const { return this->aeron_flags & fl; }
+  void set_ae( uint32_t fl )   { this->aeron_flags |= fl; }
+  void clear_ae( uint32_t fl ) { this->aeron_flags &= ~fl; }
 
   void * operator new( size_t, void *ptr ) { return ptr; }
   EvAeron( kv::EvPoll &p ) noexcept;
   static EvAeron *create_aeron( kv::EvPoll &p ) noexcept;
-  bool start_aeron( const char *pub_channel,  int pub_stream_id,
-                    const char *sub_channel, int sub_stream_id ) noexcept;
-  void release_aeron( void ) noexcept;
+  bool start_aeron( AeronSvcId *id,  const char *pub_channel,
+                    int pub_stream_id,  const char *sub_channel,
+                    int sub_stream_id ) noexcept;
+  void do_shutdown( void ) noexcept;
 
   /* EvSocket */
   virtual void write( void ) noexcept final;
@@ -397,6 +437,7 @@ struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
 
   bool init_pubsub( const char *pub_channel,  int pub_stream_id,
                     const char *sub_channel,  int sub_stream_id ) noexcept;
+  void release_aeron( void ) noexcept;
   static void poll_handler( void *clientd,  const uint8_t *buffer,
                             size_t length,  aeron_header_t *header );
   void on_poll_handler( const uint8_t *buffer,  size_t length,
@@ -413,6 +454,7 @@ struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
   virtual void on_punsub( uint32_t h,  const char *pattern,  size_t patlen,
                     const char *prefix,  uint8_t prefix_len,
                     uint32_t src_fd,  uint32_t rcnt,  char src_type ) noexcept;
+  virtual void on_connect( void ) noexcept;
 
   void publish_my_subs( void ) noexcept;
   void send_dataloss( AeronSession &session ) noexcept;
@@ -421,6 +463,8 @@ struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
   void clear_pattern_subs( AeronSession &session ) noexcept;
   void clear_all_subs( void ) noexcept;
   void print_stats( void ) noexcept;
+  void start_shutdown( void ) noexcept;
+  bool check_shutdown( void ) noexcept;
 };
 
 }
