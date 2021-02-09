@@ -87,14 +87,15 @@ dlnk_lib    += -lraikv
 endif
 
 ifeq (yes,$(have_aeron_submodule))
-aeron_lib     := aeron/$(libd)/libaeron_static.a
-aeron_dll     := aeron/$(libd)/libaeron.so
-aeron_include := -Iaeron/aeron-client/src/main/c
-lnk_lib       += -rdynamic $(aeron_lib)
-lnk_dep       += $(aeron_lib)
-dlnk_lib      += -Laeron/$(libd) -laeron
-dlnk_dep      += $(aeron_dll)
-rpath5         = ,-rpath,$(pwd)/aeron/$(libd)
+aeron_lib        := aeron/$(libd)/libaeron_static.a
+aeron_driver_lib := aeron/$(libd)/libaeron_driver_static.a
+aeron_dll        := aeron/$(libd)/libaeron.so
+aeron_include    := -Iaeron/aeron-client/src/main/c
+lnk_lib          += -rdynamic $(aeron_lib)
+lnk_dep          += $(aeron_lib)
+dlnk_lib         += -Laeron/$(libd) -laeron
+dlnk_dep         += $(aeron_dll)
+rpath5            = ,-rpath,$(pwd)/aeron/$(libd)
 aeron_client_lib     := aeron/$(libd)/libaeron_client.a
 aeron_client_dll     := aeron/$(libd)/libaeron_client_shared.so
 aeron_client_include := -Iaeron/aeron-client/src/main/cpp
@@ -133,7 +134,7 @@ clean_kv:
 clean_subs += clean_kv
 endif
 ifeq (yes,$(have_aeron_submodule))
-$(aeron_lib) $(aeron_dll):
+$(aeron_lib) $(aeron_dll) $(aeron_driver_lib):
 	$(MAKE) -C aeron
 .PHONY: clean_aeron
 clean_aeron:
@@ -156,7 +157,7 @@ all_dlls    :=
 all_depends :=
 gen_files   :=
 
-libaekv_files := ev_aeron
+libaekv_files := ev_aeron coroutine
 libaekv_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(libaekv_files)))
 libaekv_dbjs  := $(addprefix $(objd)/, $(addsuffix .fpic.o, $(libaekv_files)))
 libaekv_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(libaekv_files))) \
@@ -172,7 +173,7 @@ all_libs    += $(libd)/libaekv.a
 all_dlls    += $(libd)/libaekv.so
 all_depends += $(libaekv_deps)
 
-server_defines     := -DAERONMD_VER=$(ver_build)
+server_defines     := -DAEKV_VER=$(ver_build)
 aeron_server_files := server
 aeron_server_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(aeron_server_files)))
 aeron_server_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(aeron_server_files)))
@@ -186,33 +187,58 @@ all_depends += $(aeron_server_deps)
 
 cping_defines        := -D_DEFAULT_SOURCE
 cpong_defines        := $(cping_defines)
+cping_coro_defines   := $(cping_defines)
+cpong_coro_defines   := $(cping_defines)
 sample_util_defines  := $(cping_defines)
 basic_sub_defines    := $(cping_defines)
 basic_pub_defines    := $(cping_defines)
 BasicSub_defines     := $(cping_defines)
 BasicPub_defines     := $(cping_defines)
+aeronmd_defines      := -D_DEFAULT_SOURCE -DDISABLE_BOUNDS_CHECKS -DHAVE_STRUCT_MMSGHDR \
+                        -DHAVE_EPOLL -DHAVE_BSDSTDLIB_H -DHAVE_RECVMMSG -DHAVE_SENDMMSG \
+			-D_FILE_OFFSET_BITS=64
 
-cping_includes       := -Iaeron/HdrHistogram_c/src -Iaeron/aeron-samples/src/main/c
-cpong_includes       := $(cping_includes)
-sample_util_includes := $(cping_includes)
-basic_sub_includes   := $(cping_includes)
-basic_pub_includes   := $(cping_includes)
+cl_includes          := -Iaeron/HdrHistogram_c/src -Iaeron/aeron-samples/src/main/c
+cping_includes       := $(cl_includes) -Iaeron/aeron-driver/src/main/c -Iaeron/aeron-driver/src/main/c
+cpong_includes       := $(cl_includes) -Iaeron/aeron-driver/src/main/c -Iaeron/aeron-driver/src/main/c
+cping_coro_includes  := $(cl_includes)
+cpong_coro_includes  := $(cl_includes)
+sample_util_includes := $(cl_includes)
+basic_sub_includes   := $(cl_includes)
+basic_pub_includes   := $(cl_includes)
 BasicSub_includes    := -Iaeron/aeron-samples/src/main/cpp -Iaeron/aeron-client/src/main/cpp
 BasicPub_includes    := -Iaeron/aeron-samples/src/main/cpp -Iaeron/aeron-client/src/main/cpp
+aeronmd_includes     := -Iaeron/aeron-driver/src/main/c -Iaeron/aeron-driver/src/main/c
+
+cping_coro_files := cping_coro sample_util
+cping_coro_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(cping_coro_files)))
+cping_coro_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(cping_coro_files)))
+cping_coro_libs  := $(aeron_lib) $(aeron_driver_lib) $(aekv_lib)
+cping_coro_lnk   := -rdynamic $(aeron_lib) $(aeron_driver_lib) $(aekv_lib) aeron/HdrHistogram_c/$(libd)/libhdrhist.a -ldl
+
+$(bind)/cping_coro: $(cping_coro_objs) $(cping_coro_libs) $(lnk_dep)
+
+cpong_coro_files := cpong_coro sample_util
+cpong_coro_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(cpong_coro_files)))
+cpong_coro_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(cpong_coro_files)))
+cpong_coro_libs  := $(aeron_lib) $(aeron_driver_lib) $(aekv_lib)
+cpong_coro_lnk   := -rdynamic $(aeron_lib) $(aeron_driver_lib) $(aekv_lib) aeron/HdrHistogram_c/$(libd)/libhdrhist.a -ldl
+
+$(bind)/cpong_coro: $(cpong_coro_objs) $(cpong_coro_libs) $(lnk_dep)
 
 cping_files := cping sample_util
 cping_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(cping_files)))
 cping_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(cping_files)))
-cping_libs  := $(aeron_lib)
-cping_lnk   := -rdynamic $(aeron_lib) aeron/HdrHistogram_c/$(libd)/libhdrhist.a -ldl
+cping_libs  := $(aeron_lib) $(aeron_driver_lib) $(aekv_lib)
+cping_lnk   := -rdynamic $(aeron_lib) $(aeron_driver_lib) $(aekv_lib) aeron/HdrHistogram_c/$(libd)/libhdrhist.a -lbsd -ldl
 
 $(bind)/cping: $(cping_objs) $(cping_libs) $(lnk_dep)
 
 cpong_files := cpong sample_util
 cpong_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(cpong_files)))
 cpong_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(cpong_files)))
-cpong_libs  := $(aeron_lib)
-cpong_lnk   := -rdynamic $(aeron_lib) aeron/HdrHistogram_c/$(libd)/libhdrhist.a -ldl
+cpong_libs  := $(aeron_lib) $(aeron_driver_lib) $(aekv_lib)
+cpong_lnk   := -rdynamic $(aeron_lib) $(aeron_driver_lib) $(aekv_lib) aeron/HdrHistogram_c/$(libd)/libhdrhist.a -lbsd -ldl
 
 $(bind)/cpong: $(cpong_objs) $(cpong_libs) $(lnk_dep)
 
@@ -248,12 +274,32 @@ BasicPub_lnk   := $(aeron_client_lib) -ldl
 
 $(bind)/BasicPub: $(BasicPub_objs) $(BasicPub_libs) $(lnk_dep)
 
+aeronmd_files := aeronmd
+aeronmd_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(aeronmd_files)))
+aeronmd_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(aeronmd_files)))
+aeronmd_libs  := $(aeron_driver_lib)
+aeronmd_lnk   := -rdynamic $(aeron_driver_lib) -lbsd -ldl
+
+$(bind)/aeronmd: $(aeronmd_objs) $(aeronmd_libs) $(lnk_dep)
+
+coro_test_files := coro_test
+coro_test_objs  := $(addprefix $(objd)/, $(addsuffix .o, $(coro_test_files)))
+coro_test_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(coro_test_files)))
+coro_test_libs  := $(aekv_lib)
+coro_test_lnk   := $(aekv_lib) $(lnk_lib)
+
+$(bind)/coro_test: $(coro_test_objs) $(coro_test_libs) $(lnk_dep)
+
 all_exes    += $(bind)/cping $(bind)/cpong \
+               $(bind)/cping_coro $(bind)/cpong_coro \
                $(bind)/basic_sub $(bind)/basic_pub \
-               $(bind)/BasicSub $(bind)/BasicPub
+               $(bind)/BasicSub $(bind)/BasicPub \
+	       $(bind)/aeronmd $(bind)/coro_test
 all_depends += $(cping_deps) $(cpong_deps) \
+               $(cping_coro_deps) $(cpong_coro_deps) \
                $(basic_sub_deps) $(basic_pub_deps) \
-               $(BasicSub_deps) $(BasicPub_deps)
+               $(BasicSub_deps) $(BasicPub_deps) \
+	       $(aeronmd_deps) $(coro_test_deps)
 
 all_dirs := $(bind) $(libd) $(objd) $(dependd)
 

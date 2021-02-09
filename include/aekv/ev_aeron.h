@@ -4,10 +4,15 @@
 extern "C" {
 typedef struct aeron_stct                    aeron_t;
 typedef struct aeron_context_stct            aeron_context_t;
+typedef struct aeron_client_conductor_stct   aeron_client_conductor_t;
 typedef struct aeron_publication_stct        aeron_publication_t;
 typedef struct aeron_subscription_stct       aeron_subscription_t;
 typedef struct aeron_fragment_assembler_stct aeron_fragment_assembler_t;
 typedef struct aeron_header_stct             aeron_header_t;
+typedef struct aeron_client_registering_resource_stct
+  aeron_async_add_subscription_t;
+typedef struct aeron_client_registering_resource_stct
+  aeron_async_add_publication_t;
 }
 
 #include <raikv/ev_net.h>
@@ -392,26 +397,30 @@ struct AeronSvcId {
 struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
                  public kv::RouteNotify {
   enum {
-    AE_FLAG_SHUTDOWN     = 1,
-    AE_FLAG_BACKPRESSURE = 2
+    AE_FLAG_INIT         = 1,
+    AE_FLAG_SHUTDOWN     = 2,
+    AE_FLAG_BACKPRESSURE = 4
   };
 
-  aeron_context_t            * context;
-  aeron_t                    * aeron;
-  aeron_publication_t        * pub;
-  aeron_subscription_t       * sub;
-  aeron_fragment_assembler_t * fragment_asm;
-  AeronSubMap                  sub_tab;     /* active subscriptions on net */
-  AeronPatternSubMap           pat_sub_tab; /* active wildcards on net */
-  MyPeers                      my_peers;
-  MySubs                       my_subs;
-  uint64_t                     next_timer_id,
-                               timer_id,
-                               cur_mono_ns;
-  uint32_t                     max_payload_len,
-                               timer_count,
-                               shutdown_count,
-                               aeron_flags;
+  aeron_context_t                * context;
+  aeron_t                        * aeron;
+  aeron_client_conductor_t       * conductor;
+  aeron_publication_t            * pub;
+  aeron_subscription_t           * sub;
+  aeron_fragment_assembler_t     * fragment_asm;
+  aeron_async_add_publication_t  * async_pub;
+  aeron_async_add_subscription_t * async_sub;
+  AeronSubMap                      sub_tab;     /* active subscriptions */
+  AeronPatternSubMap               pat_sub_tab; /* active wildcards */
+  MyPeers                          my_peers;
+  MySubs                           my_subs;
+  uint64_t                         next_timer_id,
+                                   timer_id,
+                                   cur_mono_ns;
+  uint32_t                         max_payload_len,
+                                   timer_count,
+                                   shutdown_count,
+                                   aeron_flags;
 
   uint32_t test_ae( uint32_t fl ) const { return this->aeron_flags & fl; }
   void set_ae( uint32_t fl )   { this->aeron_flags |= fl; }
@@ -434,9 +443,11 @@ struct EvAeron : public kv::EvSocket, public kv::KvSendQueue,
   virtual void process_shutdown( void ) noexcept final;
   virtual void process_close( void ) noexcept final;
   virtual bool on_msg( kv::EvPublish &pub ) noexcept;
+  virtual bool busy_poll( void ) noexcept;
 
   bool init_pubsub( const char *pub_channel,  int pub_stream_id,
                     const char *sub_channel,  int sub_stream_id ) noexcept;
+  bool finish_init( void ) noexcept;
   void release_aeron( void ) noexcept;
   static void poll_handler( void *clientd,  const uint8_t *buffer,
                             size_t length,  aeron_header_t *header );

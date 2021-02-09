@@ -40,9 +40,7 @@
 #include <aekv/coroutine.h>
 
 #include "aeronc.h"
-#include "aeronmd.h"
 #include "aeron_client.h"
-#include "aeron_driver_context.h"
 #include "concurrent/aeron_atomic.h"
 #include "util/aeron_strutil.h"
 #include "util/aeron_parse_util.h"
@@ -67,30 +65,24 @@ const char usage_str[] =
 #define MAX_MESSAGE_LENGTH (64 * 1024)
 
 typedef struct {
-  coroutine_t *client_coro,
-              *runner_coro;
-  aeron_t     *aeron;
-  const char  *pong_channel;
-  const char  *ping_channel;
-  int32_t      pong_stream_id;
-  int32_t      ping_stream_id;
-  uint64_t     messages;
-  uint64_t     message_length;
-  uint64_t     warm_up_messages;
-
-  aeron_async_add_subscription_t          *async_pong_sub;
+  schedule_t *sched;
+  coroutine_t *c, *r;
+  aeron_t *aeron;
+  const char *pong_channel;
+  const char *ping_channel;
+  uint64_t messages;
+  uint64_t message_length;
+  uint64_t warm_up_messages;
+  aeron_async_add_subscription_t *async_pong_sub;
   aeron_async_add_exclusive_publication_t *async_ping_pub;
-  aeron_subscription_t                    *subscription;
-  aeron_image_t                           *image;
-  aeron_exclusive_publication_t           *publication;
-  aeron_image_fragment_assembler_t        *fragment_assembler;
-  struct hdr_histogram                    *histogram;
+  aeron_subscription_t *subscription;
+  aeron_image_t *image;
+  aeron_exclusive_publication_t *publication;
+  aeron_image_fragment_assembler_t *fragment_assembler;
+  int32_t pong_stream_id;
+  int32_t ping_stream_id;
+  struct hdr_histogram *histogram;
 } ping_client_t;
-
-typedef struct {
-  coroutine_t    *driver_coro;
-  aeron_driver_t *driver;
-} driver_data_t;
 
 volatile bool running = true;
 
@@ -106,19 +98,50 @@ inline bool is_running()
     return result;
 }
 
-void termination_hook(void *state)
+void null_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header)
 {
-    AERON_PUT_ORDERED(running, false);
 }
 
-uint32_t i, k, cntr, indx[ 10000 ], slow[ 10000 ];
-
-void coro_driver( coroutine_t *coro, driver_data_t *dr )
+void pong_measuring_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header)
 {
-    while ( is_running() )
+    struct hdr_histogram *histogram = (struct hdr_histogram *)clientd;
+    int64_t end_ns = aeron_nano_clock();
+    int64_t start_ns;
+
+    memcpy(&start_ns, buffer, sizeof(uint64_t));
+    hdr_record_value(histogram, end_ns - start_ns);
+}
+
+void send_ping_and_receive_pong(
+    ping_client_t *cl,
+    coroutine_t *coro,
+    aeron_fragment_handler_t fragment_handler,
+    void *poll_clientd,
+    uint64_t message_count )
+{
+    uint8_t message[MAX_MESSAGE_LENGTH];
+    int64_t *timestamp = (int64_t *)message;
+
+    memset(message, 0, sizeof(message));
+
+    for (size_t i = 0; i < message_count && is_running(); i++)
     {
-        aeron_driver_main_do_work( dr->driver );
-        coroutine_yield( coro );
+        int64_t position;
+
+        do
+        {
+            *timestamp = aeron_nano_clock();
+        }
+        while ((position = aeron_exclusive_publication_offer(
+            cl->publication, message, cl->message_length, NULL, NULL)) < 0);
+
+        while (aeron_image_position(cl->image) < position)
+        {
+            while (aeron_image_poll(cl->image, fragment_handler, poll_clientd, DEFAULT_FRAGMENT_COUNT_LIMIT) <= 0)
+            {
+                coroutine_yield( coro );
+            }
+        }
     }
 }
 
@@ -132,62 +155,6 @@ void coro_runner( coroutine_t *coro, ping_client_t *cl )
         coroutine_yield( coro );
     }
     runner->state = AERON_AGENT_STATE_STOPPED;
-}
-
-void null_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header)
-{
-}
-
-void pong_measuring_handler(void *clientd, const uint8_t *buffer, size_t length, aeron_header_t *header)
-{
-    struct hdr_histogram *histogram = (struct hdr_histogram *)clientd;
-    int64_t end_ns = aeron_nano_clock();
-    int64_t start_ns;
-
-    memcpy(&start_ns, buffer, sizeof(uint64_t));
-    hdr_record_value(histogram, end_ns - start_ns);
-    if ( k < sizeof( slow ) / sizeof( slow[ 0 ] ) && end_ns - start_ns > 100000 ) {
-      indx[ k ] = i;
-      slow[ k ] = end_ns - start_ns;
-      k++;
-    }
-    i++;
-}
-
-void send_ping_and_receive_pong(
-    ping_client_t *cl,
-    coroutine_t *coro,
-    aeron_fragment_handler_t fragment_handler,
-    void *poll_clientd,
-    uint64_t message_count )
-{
-    uint8_t message[MAX_MESSAGE_LENGTH];
-    int64_t *timestamp = (int64_t *)message;
-    uint32_t *cntr = (uint32_t *) &message[ 8 ];
-
-    memset(message, 0, sizeof(message));
-
-    for (size_t i = 0; i < message_count && is_running(); i++)
-    {
-        int64_t position;
-
-        *timestamp = aeron_nano_clock();
-        *cntr = i;
-        while ((position = aeron_exclusive_publication_offer(
-            cl->publication, message, cl->message_length, NULL, NULL)) < 0)
-        {
-            coroutine_yield( coro );
-            *timestamp = aeron_nano_clock();
-        }
-
-        while (aeron_image_position(cl->image) < position)
-        {
-            while (aeron_image_poll(cl->image, fragment_handler, poll_clientd, DEFAULT_FRAGMENT_COUNT_LIMIT) <= 0)
-            {
-                coroutine_yield( coro );
-            }
-        }
-    }
 }
 
 void coro_client( coroutine_t *coro,  ping_client_t *cl )
@@ -206,6 +173,24 @@ void coro_client( coroutine_t *coro,  ping_client_t *cl )
         goto cleanup;
     }
 
+    while (NULL == cl->subscription)
+    {
+        if (aeron_async_add_subscription_poll(&cl->subscription, cl->async_pong_sub) < 0)
+        {
+            fprintf(stderr, "aeron_async_add_subscription_poll: %s\n", aeron_errmsg());
+            goto cleanup;
+        }
+
+        if (!is_running())
+        {
+            goto cleanup;
+        }
+
+        coroutine_yield( coro );
+    }
+
+    printf("Subscription channel status %" PRIu64 "\n", aeron_subscription_channel_status(cl->subscription));
+
     if (aeron_async_add_exclusive_publication(
         &cl->async_ping_pub,
         cl->aeron,
@@ -216,35 +201,22 @@ void coro_client( coroutine_t *coro,  ping_client_t *cl )
         goto cleanup;
     }
 
-    for (;;)
+    while (NULL == cl->publication)
     {
-        if (NULL == cl->subscription)
+        if (aeron_async_add_exclusive_publication_poll(&cl->publication, cl->async_ping_pub) < 0)
         {
-            if (aeron_async_add_subscription_poll(&cl->subscription, cl->async_pong_sub) < 0)
-            {
-                fprintf(stderr, "aeron_async_add_subscription_poll: %s\n", aeron_errmsg());
-                goto cleanup;
-            }
+            fprintf(stderr, "aeron_async_add_exclusive_publication_poll: %s\n", aeron_errmsg());
+            goto cleanup;
         }
-        if (NULL == cl->publication)
-        {
-            if (aeron_async_add_exclusive_publication_poll(&cl->publication, cl->async_ping_pub) < 0)
-            {
-                fprintf(stderr, "aeron_async_add_exclusive_publication_poll: %s\n", aeron_errmsg());
-                goto cleanup;
-            }
-        }
-        if (NULL != cl->subscription && NULL != cl->publication)
-            break;
 
         if (!is_running())
         {
             goto cleanup;
         }
+
         coroutine_yield( coro );
     }
 
-    printf("Subscription channel status %" PRIu64 "\n", aeron_subscription_channel_status(cl->subscription));
     printf("Publication channel status %" PRIu64 "\n", aeron_exclusive_publication_channel_status(cl->publication));
 
     while (!aeron_subscription_is_connected(cl->subscription))
@@ -253,6 +225,7 @@ void coro_client( coroutine_t *coro,  ping_client_t *cl )
         {
             goto cleanup;
         }
+
         coroutine_yield( coro );
     }
 
@@ -299,42 +272,18 @@ cleanup:
     coroutine_yield( coro );
     aeron_image_fragment_assembler_delete(cl->fragment_assembler);
 }
-#if 0
-static void aeron_stat_print_counter(
-    int64_t value,
-    int32_t id,
-    int32_t type_id,
-    const uint8_t *key,
-    size_t key_length,
-    const char *label,
-    size_t label_length,
-    void *clientd)
-{
-    char value_str[AERON_FORMAT_NUMBER_TO_LOCALE_STR_LEN];
-    printf(
-        "%3" PRId32 " : %20s - %.*s\n",
-        id,
-        aeron_format_number_to_locale(value, value_str, sizeof(value_str)),
-        (int)label_length, label);
-}
-#endif
+
 int main(int argc, char **argv)
 {
-    schedule_t             *sched      = NULL;
-    aeron_context_t        *context    = NULL;
-    aeron_driver_context_t *dr_context = NULL;
-    const char             *aeron_dir  = NULL;
-    /*aeron_cnc_t            *aeron_cnc  = NULL;*/
-    ping_client_t           cl;
-    driver_data_t           dr;
-    int                     status = EXIT_FAILURE,
-                            opt;
+    aeron_context_t *context = NULL;
+    const char *aeron_dir = NULL;
+    ping_client_t cl;
+    int status = EXIT_FAILURE, opt;
+
     memset( &cl, 0, sizeof( cl ) );
-    memset( &dr, 0, sizeof( dr ) );
-    sched          = coroutine_open();
-    cl.runner_coro = coroutine_new( sched, (coroutine_func_t) coro_runner, &cl, "runner" );
-    cl.client_coro = coroutine_new( sched, (coroutine_func_t) coro_client, &cl, "client" );
-    dr.driver_coro = coroutine_new( sched, (coroutine_func_t) coro_driver, &dr, "driver" );
+    cl.sched = coroutine_open();
+    cl.r     = coroutine_new( cl.sched, (coroutine_func_t) coro_runner, &cl, "runner" );
+    cl.c     = coroutine_new( cl.sched, (coroutine_func_t) coro_client, &cl, "client" );
 
     cl.pong_channel     = DEFAULT_PONG_CHANNEL;
     cl.ping_channel     = DEFAULT_PING_CHANNEL;
@@ -424,107 +373,39 @@ int main(int argc, char **argv)
 
     signal(SIGINT, sigint_handler);
 
-    if (aeron_driver_context_init(&dr_context) < 0)
+    printf("Publishing Ping at channel %s on Stream ID %" PRId32 "\n", cl.ping_channel, cl.ping_stream_id);
+    printf("Subscribing Pong at channel %s on Stream ID %" PRId32 "\n", cl.pong_channel, cl.pong_stream_id);
+
+    if (aeron_context_init(&context) < 0)
     {
-        fprintf(stderr, "aeron_driver_context_init: %s\n", aeron_errmsg());
+        fprintf(stderr, "aeron_context_init: %s\n", aeron_errmsg());
         goto cleanup;
     }
 
-    if (NULL != aeron_dir && aeron_driver_context_set_dir(dr_context, aeron_dir) < 0)
+    if (NULL != aeron_dir)
     {
-        fprintf(stderr, "aeron_context_set_dir: %s\n", aeron_errmsg());
-        goto cleanup;
-    }
-    dr_context->threading_mode = AERON_THREADING_MODE_SHARED;
-
-    if (aeron_driver_context_set_driver_termination_hook(dr_context, termination_hook, NULL) < 0)
-    {
-        fprintf(stderr, "ERROR: context set termination hook (%d) %s\n", aeron_errcode(), aeron_errmsg());
-        goto cleanup;
-    }
-
-    if (aeron_driver_init(&dr.driver, dr_context) < 0)
-    {
-        fprintf(stderr, "ERROR: driver init (%d) %s\n", aeron_errcode(), aeron_errmsg());
-        goto cleanup;
-    }
-
-    if (aeron_driver_start(dr.driver, true) < 0)
-    {
-        fprintf(stderr, "ERROR: driver start (%d) %s\n", aeron_errcode(), aeron_errmsg());
-        goto cleanup;
-    }
-
-    coroutine_resume(dr.driver_coro);
-
-    if (coroutine_status(dr.driver_coro) && is_running())
-    {
-        printf("Publishing Ping at channel %s on Stream ID %" PRId32 "\n", cl.ping_channel, cl.ping_stream_id);
-        printf("Subscribing Pong at channel %s on Stream ID %" PRId32 "\n", cl.pong_channel, cl.pong_stream_id);
-
-        if (aeron_context_init(&context) < 0)
-        {
-            fprintf(stderr, "aeron_context_init: %s\n", aeron_errmsg());
-            goto cleanup;
-        }
-
-        if (NULL != aeron_dir && aeron_context_set_dir(context, aeron_dir) < 0)
+        if (aeron_context_set_dir(context, aeron_dir) < 0)
         {
             fprintf(stderr, "aeron_context_set_dir: %s\n", aeron_errmsg());
             goto cleanup;
         }
+    }
 
-        if (aeron_init(&cl.aeron, context) < 0)
-        {
-            fprintf(stderr, "aeron_init: %s\n", aeron_errmsg());
-            goto cleanup;
-        }
+    if (aeron_init(&cl.aeron, context) < 0)
+    {
+        fprintf(stderr, "aeron_init: %s\n", aeron_errmsg());
+        goto cleanup;
+    }
 
-        while (coroutine_status(cl.runner_coro) && coroutine_status(cl.client_coro) && coroutine_status(dr.driver_coro))
-        {
-            coroutine_resume(cl.runner_coro);
-            coroutine_resume(cl.client_coro);
-            coroutine_resume(dr.driver_coro);
-        }
-    }
-    else
+    while ( coroutine_status( cl.r ) && coroutine_status( cl.c ) )
     {
-        fprintf(stderr, "coroutine_status: %s\n", aeron_errmsg());
+        coroutine_resume( cl.r );
+        coroutine_resume( cl.c );
     }
-#if 0
-    if (aeron_cnc_init(&aeron_cnc, aeron_driver_context_get_dir(dr_context), 1) == 0)
-    {
-        aeron_cnc_constants_t cnc_constants;
-        aeron_cnc_constants(aeron_cnc, &cnc_constants);
-        aeron_counters_reader_t *counters_reader = aeron_cnc_counters_reader(aeron_cnc);
-        aeron_counters_reader_foreach_counter(counters_reader, aeron_stat_print_counter, NULL);
-        aeron_cnc_close(aeron_cnc);
-    }
-    else
-    {
-        fprintf(stderr, "aeron_cnc_init: %s\n", aeron_errmsg());
-    }
-#endif
+
 cleanup:
     aeron_close(cl.aeron);
     aeron_context_close(context);
-
-    if (0 != aeron_driver_close(dr.driver))
-    {
-        fprintf(stderr, "ERROR: driver close (%d) %s\n", aeron_errcode(), aeron_errmsg());
-    }
-
-    if (0 != aeron_driver_context_close(dr_context))
-    {
-        fprintf(stderr, "ERROR: driver context close (%d) %s\n", aeron_errcode(), aeron_errmsg());
-    }
-    coroutine_close(sched);
-
-    FILE *out = fopen( "out", "w" );
-    uint32_t j;
-    for ( j = 0; j < k; j++ )
-      fprintf( out, "%u %u\n", indx[ j ], slow[ j ] );
-    fclose( out );
 
     return status;
 }

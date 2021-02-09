@@ -9,9 +9,12 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <aekv/ev_aeron.h>
-#include <aeronc.h>
 #include <raikv/ev_publish.h>
 #include <raikv/delta_coder.h>
+extern "C" {
+#include <aeronc.h>
+#include <aeron_client.h>
+}
 
 using namespace rai;
 using namespace aekv;
@@ -23,13 +26,15 @@ static const uint64_t AERON_POLL_US      = 100,
                       AERON_TIMEOUT_NS   = AERON_HEARTBEAT_US * 1000 * 25;
 static const uint32_t POLL_EVENT_ID = 0,
                       HB_EVENT_ID   = 1;
+#define CONDUCTOR
 /*static char aeron_dbg_path[ 40 ];*/
 
 EvAeron::EvAeron( EvPoll &p ) noexcept
     : EvSocket( p, p.register_type( "aeron" ) ),
       KvSendQueue( p.create_ns(), p.ctx_id ),
-      context( 0 ), aeron( 0 ), pub( 0 ), sub( 0 ), fragment_asm( 0 ),
-      timer_id( 0 ), max_payload_len( MAX_KV_MSG_SIZE ), timer_count( 0 ),
+      context( 0 ), aeron( 0 ), conductor( 0 ), pub( 0 ), sub( 0 ),
+      fragment_asm( 0 ), async_pub( 0 ), async_sub( 0 ), timer_id( 0 ),
+      max_payload_len( MAX_KV_MSG_SIZE ), timer_count( 0 ),
       shutdown_count( 0 ), aeron_flags( 0 )
 {
   this->next_timer_id = (uint64_t) this->sock_type << 56;
@@ -137,52 +142,114 @@ EvAeron::start_aeron( AeronSvcId *id,  const char *pub_channel,
   this->idle_push( EV_WRITE );
   return true;
 }
+/*bool
+EvAeron::conductor_do_work( void ) noexcept
+{
+  return aeron_client_conductor_do_work( this->conductor ) > 0;
+}*/
 /* tell the aeron driver which sub and pub streams are used */
 bool
 EvAeron::init_pubsub( const char *pub_channel,  int pub_stream_id,
                       const char *sub_channel,  int sub_stream_id ) noexcept
 {
-  aeron_async_add_publication_t  * async_pub = NULL;
-  aeron_async_add_subscription_t * async_sub = NULL;
   int status = aeron_context_init( &this->context );
   if ( status == 0 )
     status = aeron_init( &this->aeron, this->context );
+#ifdef CONDUCTOR
+  if ( status == 0 ) {
+    this->aeron->runner.state = AERON_AGENT_STATE_MANUAL;
+    this->conductor = &this->aeron->conductor;
+  }
+#else
   if ( status == 0 )
     status = aeron_start( this->aeron );
+#endif
   if ( status == 0 )
     status = aeron_async_add_publication( &async_pub, this->aeron, pub_channel,
                                           pub_stream_id );
-  if ( status == 0 ) {
-    for (;;) {
-      status = aeron_async_add_publication_poll( &this->pub, async_pub );
-      if ( status != 0 ) /* -1 = error, 1 = success */
-        break;
-    }
-    if ( status >= 0 ) {
-      aeron_publication_constants_t c;
-      status = aeron_publication_constants( this->pub, &c );
-      if ( status == 0 )
-        this->max_payload_len = c.max_payload_length;
-    }
-  }
-  if ( status >= 0 )
+  if ( status == 0 )
     status = aeron_async_add_subscription( &async_sub, this->aeron, sub_channel,
                                            sub_stream_id, print_avail_img,
                                            NULL, print_unavail_img, NULL );
   if ( status == 0 ) {
-    for (;;) {
-      status = aeron_async_add_subscription_poll( &this->sub, async_sub );
-      if ( status != 0 )
-        break;
-    }
-  }
-  if ( status >= 0 )
-    status = aeron_fragment_assembler_create( &this->fragment_asm,
-                                              EvAeron::poll_handler, this );
-  if ( status == 0 )
+    this->set_ae( AE_FLAG_INIT );
     return true;
+  }
   this->release_aeron();
   return false;
+}
+
+bool
+EvAeron::busy_poll( void ) noexcept
+{
+#ifdef CONDUCTOR
+  aeron_client_conductor_do_work( this->conductor );
+#endif
+  this->read();
+  return false;
+#if 0
+  if ( aeron_client_conductor_do_work( this->conductor ) > 0 )
+    this->read();
+  return false;
+#endif
+}
+
+bool
+EvAeron::finish_init( void ) noexcept
+{
+  int status;
+  if ( this->pub == NULL ) {
+    status = aeron_async_add_publication_poll( &this->pub, this->async_pub );
+#ifdef CONDUCTOR
+    if ( status == 0 ) {
+      aeron_client_conductor_do_work( this->conductor );
+      status = aeron_async_add_publication_poll( &this->pub, this->async_pub );
+    }
+#endif
+    if ( status != 0 ) {
+      if ( status > 0 ) {
+        aeron_publication_constants_t c;
+        status = aeron_publication_constants( this->pub, &c );
+        if ( status == 0 )
+          this->max_payload_len = c.max_payload_length;
+      }
+      if ( status != 0 ) {
+        fprintf( stderr, "aeron_async_add_publication_poll: %d, %s\n",
+                 status, aeron_errmsg() );
+        this->push( EV_CLOSE );
+        return false;
+      }
+    }
+  }
+  if ( this->sub == NULL ) {
+    status = aeron_async_add_subscription_poll( &this->sub, this->async_sub );
+#ifdef CONDUCTOR
+    if ( status == 0 ) {
+      aeron_client_conductor_do_work( this->conductor );
+      status = aeron_async_add_subscription_poll( &this->sub, this->async_sub );
+    }
+#endif
+    if ( status != 0 ) {
+      if ( status > 0 ) {
+        status = aeron_fragment_assembler_create( &this->fragment_asm,
+                                                  EvAeron::poll_handler,
+                                                  this );
+      }
+      if ( status != 0 ) {
+        fprintf( stderr, "aeron_async_add_subscription_poll: %d, %s\n",
+                 status, aeron_errmsg() );
+        this->push( EV_CLOSE );
+        return false;
+      }
+    }
+  }
+  if ( this->pub == NULL || this->sub == NULL )
+    return false;
+  this->clear_ae( AE_FLAG_INIT );
+#if 0
+  this->idle_push( EV_BUSY_POLL );
+#endif
+  return true;
 }
 
 void
@@ -216,12 +283,17 @@ EvAeron::release_aeron( void ) noexcept
   this->clear_ae( AE_FLAG_BACKPRESSURE );
   this->set_ae( AE_FLAG_SHUTDOWN );
 }
+
 /* send the messages queued */
 void
 EvAeron::write( void ) noexcept
 {
+  if ( this->test_ae( AE_FLAG_SHUTDOWN | AE_FLAG_INIT ) == AE_FLAG_INIT ) {
+    if ( ! this->finish_init() )
+      return;
+  }
   this->pop( EV_WRITE );
-  if ( ! this->test_ae( AE_FLAG_SHUTDOWN ) ) {
+  if ( ! this->test_ae( AE_FLAG_SHUTDOWN | AE_FLAG_INIT ) ) {
     int64_t status;
     int retry_count = 0;
     while ( ! this->sendq.is_empty() ) {
@@ -239,6 +311,11 @@ EvAeron::write( void ) noexcept
         }
         /* try again later */
         if ( status == AERON_PUBLICATION_BACK_PRESSURED ) {
+#ifdef CONDUCTOR
+          if ( aeron_client_conductor_do_work( this->conductor ) > 0 )
+#endif
+            if ( ++retry_count < 3 )
+              goto retry;
           this->set_ae( AE_FLAG_BACKPRESSURE );
           return;
         }
@@ -247,7 +324,7 @@ EvAeron::write( void ) noexcept
                                             (const uint8_t *) (void *) &l->msg,
                                             l->msg.size, NULL, NULL );
           if ( status < 0 ) {
-            if ( ++retry_count == 1 ) /* retry once */
+            if ( ++retry_count < 3 ) /* retry once */
               goto retry;
           }
           else {
@@ -265,6 +342,9 @@ EvAeron::write( void ) noexcept
       this->sendq.pop_hd();
     }
   }
+#ifdef CONDUCTOR
+  aeron_client_conductor_do_work( this->conductor );
+#endif
   this->clear_ae( AE_FLAG_BACKPRESSURE );
   this->snd_wrk.reset();
 }
@@ -272,15 +352,24 @@ EvAeron::write( void ) noexcept
 void
 EvAeron::read( void ) noexcept
 {
-  static const uint32_t fragment_count_limit = 128;
+  static const uint32_t fragment_count_limit = 8;
   int fragments_read;
 
-  if ( ! this->test_ae( AE_FLAG_SHUTDOWN ) ) {
+  if ( this->test_ae( AE_FLAG_SHUTDOWN | AE_FLAG_INIT ) == AE_FLAG_INIT )
+    this->finish_init();
+  if ( ! this->test_ae( AE_FLAG_SHUTDOWN | AE_FLAG_INIT ) ) {
     for (;;) {
       fragments_read = aeron_subscription_poll( this->sub,
                                              aeron_fragment_assembler_handler,
                                                 this->fragment_asm,
                                                 fragment_count_limit );
+      /*if ( fragments_read == 0 &&
+           aeron_client_conductor_do_work( this->conductor ) > 0 ) {
+        fragments_read = aeron_subscription_poll( this->sub,
+                                               aeron_fragment_assembler_handler,
+                                                  this->fragment_asm,
+                                                  fragment_count_limit );
+      }*/
       if ( fragments_read <= 0 ) {
         if ( fragments_read == 0 )
           break;
@@ -358,7 +447,11 @@ EvAeron::check_shutdown( void ) noexcept
       this->pub = NULL;
       return false;
     }
+#ifdef CONDUCTOR
+    aeron_client_conductor_do_work( this->conductor );
+#else
     usleep( 1 );
+#endif
   }
   return this->sub != NULL || this->pub != NULL;
 }
@@ -392,6 +485,9 @@ EvAeron::timer_expire( uint64_t tid,  uint64_t event_id ) noexcept
   this->cur_mono_ns = kv_current_monotonic_coarse_ns();
   switch ( event_id ) {
     case POLL_EVENT_ID: {
+#ifdef CONDUCTOR
+      aeron_client_conductor_do_work( this->conductor );
+#endif
       this->read();
       break;
     }
