@@ -25,14 +25,14 @@ endif
 
 CC          ?= gcc
 CXX         ?= g++
-cc          := $(CC)
-cpp         := $(CXX)
+cc          := $(CC) -std=c11
+cpp         := $(CXX) -std=c++11 
 # if not linking libstdc++
 ifdef NO_STL
-cppflags    := -std=c++11 -fno-rtti -fno-exceptions
+cppflags    := -fno-rtti -fno-exceptions
 cpplink     := $(CC)
 else
-cppflags    := -std=c++11
+cppflags    :=
 cpplink     := $(CXX)
 endif
 arch_cflags := -mavx -maes -fno-omit-frame-pointer
