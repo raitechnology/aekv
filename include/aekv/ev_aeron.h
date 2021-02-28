@@ -308,8 +308,8 @@ struct MyPeers {
   AeronSession *update_session( uint64_t stamp,  uint64_t seqno ) {
     if ( this->last_session->stamp == stamp )
       return this->update_last( seqno );
-
-    uint32_t h = hash( stamp ), pos, id;
+    size_t   pos;
+    uint32_t h = hash( stamp ), id;
     if ( this->session_idx->find( h, pos, id ) ) {
       this->last_session = this->sessions[ id ];
       while ( this->last_session->stamp != stamp ) {
@@ -335,7 +335,7 @@ struct MyPeers {
   }
   /* allocate new session and insert into session_idx[] */
   AeronSession *new_session( uint64_t stamp,  uint64_t seqno,
-                             uint32_t h,  uint32_t pos,
+                             uint32_t h,  size_t pos,
                              AeronSession *next_id ) noexcept;
   /* unlink session and put on free list */
   void release_session( AeronSession &session ) noexcept;

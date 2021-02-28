@@ -652,7 +652,8 @@ MySubs::append( KvSubMsg &msg ) noexcept
 void
 MySubs::upsert( KvSubMsg &msg ) noexcept
 {
-  uint32_t pos, head, next, prev, i;
+  size_t   pos;
+  uint32_t head, next, prev, i;
 
   if ( this->subs_free * 2 > this->subs_size && this->subs_free > 1024 )
     this->gc();
@@ -698,7 +699,8 @@ MySubs::upsert( KvSubMsg &msg ) noexcept
 void
 MySubs::remove( KvSubMsg &msg ) noexcept
 {
-  uint32_t pos, head, prev, i;
+  size_t   pos;
+  uint32_t head, prev, i;
 
   if ( this->subsc_idx->find( msg.hash, pos, head ) ) {
     prev = 0;
@@ -734,7 +736,8 @@ MySubs::remove( KvSubMsg &msg ) noexcept
 void
 MySubs::remove_pattern( KvSubMsg &msg ) noexcept
 {
-  uint32_t pos, head, prev, i;
+  size_t   pos;
+  uint32_t head, prev, i;
 
   if ( this->subsc_idx->find( msg.hash, pos, head ) ) {
     prev = 0;
@@ -783,7 +786,8 @@ MySubs::gc( void ) noexcept
       if ( i != j )
         ::memmove( &this->subs[ j + 1 ], &this->subs[ i + 1 ], k );
       KvSubMsg & msg = *(KvSubMsg *) (void *) &this->subs[ j + 1 ];
-      uint32_t pos, next;
+      size_t     pos;
+      uint32_t   next;
       /* if collision */
       if ( this->subsc_idx->find( msg.hash, pos, next ) )
         this->subs[ j ] = next;
@@ -1161,7 +1165,7 @@ MyPeers::release( void ) noexcept
 /* creae a new session and index by stamp */
 AeronSession *
 MyPeers::new_session( uint64_t stamp,  uint64_t seqno, uint32_t h,
-                      uint32_t pos,  AeronSession *next_id ) noexcept
+                      size_t pos,  AeronSession *next_id ) noexcept
 {
   if ( this->free_list.is_empty() ) {
     void *p = ::realloc( this->sessions,
@@ -1210,7 +1214,8 @@ MyPeers::new_session( uint64_t stamp,  uint64_t seqno, uint32_t h,
 void
 MyPeers::release_session( AeronSession &session ) noexcept
 {
-  uint32_t h = hash( session.stamp ), pos, id;
+  size_t   pos;
+  uint32_t h = hash( session.stamp ), id;
   if ( &session == this->last_session )
     this->last_session = &this->dummy_session;
   if ( this->session_idx->find( h, pos, id ) ) {
