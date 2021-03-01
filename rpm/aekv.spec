@@ -20,6 +20,7 @@ BuildRequires:  systemd
 BuildRequires:  zlib-devel
 BuildRequires:  hdrhist
 BuildRequires:  aeron
+BuildRequires:  git-core
 Requires:       raikv
 Requires:       pcre2
 Requires:       openssl
