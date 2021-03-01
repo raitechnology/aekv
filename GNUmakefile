@@ -163,7 +163,7 @@ libaekv_dbjs  := $(addprefix $(objd)/, $(addsuffix .fpic.o, $(libaekv_files)))
 libaekv_deps  := $(addprefix $(dependd)/, $(addsuffix .d, $(libaekv_files))) \
                   $(addprefix $(dependd)/, $(addsuffix .fpic.d, $(libaekv_files)))
 libaekv_dlnk  := $(dlnk_lib)
-libaekv_spec  := $(version)-$(build_num)
+libaekv_spec  := $(version)-$(build_num)_$(git_hash)
 libaekv_ver   := $(major_num).$(minor_num)
 
 $(libd)/libaekv.a: $(libaekv_objs)
